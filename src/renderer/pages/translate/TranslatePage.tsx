@@ -59,6 +59,11 @@ import TranslateHistoryList from './components/TranslateHistory'
 import TranslateInputPane from './components/TranslateInputPane'
 import TranslateLanguageBar from './components/TranslateLanguageBar'
 import TranslateOutputPane from './components/TranslateOutputPane'
+import {
+  MARKDOWN_RENDER_STREAM_CADENCE_MS,
+  markdownRenderInterval,
+  nextMarkdownRenderDelay
+} from './markdownRenderPacing'
 import type {
   BabelDocAvailability,
   PdfTranslationFile,
@@ -243,6 +248,17 @@ const TranslatePage: FC = () => {
   })
 
   const [renderedMarkdown, setRenderedMarkdown] = useState<string>('')
+  const previousOutputRef = useRef<string | undefined>(undefined)
+  const lastOutputChangeAtRef = useRef<number | undefined>(undefined)
+  const lastMarkdownRenderAtRef = useRef(0)
+  const latestOutputRef = useRef('')
+  const shikiFnRef = useRef(shikiMarkdownIt)
+  const renderTimerRef = useRef<number | null>(null)
+  const renderInFlightRef = useRef(false)
+  const pendingImmediateRef = useRef(false)
+  const outputEpochRef = useRef(0)
+  const enableMarkdownRef = useRef(true)
+  const isMountedRef = useRef(true)
   const [copied, setCopied] = useTemporaryValue(false, 2000)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -621,23 +637,125 @@ const TranslatePage: FC = () => {
     [isScrollSyncEnabled]
   )
 
+  // Commit-latest render runner: a started render is never cancelled mid-flight
+  // (per-frame cancellation caused discarded full shiki renders every frame).
+  // Content that arrived during a render arms a paced follow-up timer — never
+  // an immediate re-render — so pacing holds AND the final stream state always
+  // renders once the stream goes quiet.
+  const runMarkdownRender = useCallback(async function runMarkdownRender() {
+    if (renderInFlightRef.current) return
+    renderInFlightRef.current = true
+    const renderedContent = latestOutputRef.current
+    const epoch = outputEpochRef.current
+    try {
+      const markdown = await shikiFnRef.current(renderedContent)
+      // Epoch mismatch = output was cleared while this render was in flight.
+      if (!isMountedRef.current || !enableMarkdownRef.current || epoch !== outputEpochRef.current) return
+      lastMarkdownRenderAtRef.current = Date.now()
+      setRenderedMarkdown(markdown)
+    } finally {
+      renderInFlightRef.current = false
+    }
+    if (!isMountedRef.current || !enableMarkdownRef.current) return
+    if (epoch !== outputEpochRef.current) {
+      pendingImmediateRef.current = false
+      return
+    }
+    // An immediate request (dep change or discrete swap) skipped mid-flight
+    // must not be lost; it supersedes any armed trailing timer.
+    if (pendingImmediateRef.current) {
+      pendingImmediateRef.current = false
+      if (renderTimerRef.current !== null) {
+        window.clearTimeout(renderTimerRef.current)
+        renderTimerRef.current = null
+      }
+      void runMarkdownRender()
+      return
+    }
+    if (latestOutputRef.current !== renderedContent && renderTimerRef.current === null) {
+      renderTimerRef.current = window.setTimeout(() => {
+        renderTimerRef.current = null
+        void runMarkdownRender()
+      }, markdownRenderInterval(latestOutputRef.current))
+    }
+  }, [])
+
   useEffect(() => {
-    let cancelled = false
-    const render = async () => {
-      if (!enableMarkdown || !translateOutput) {
-        setRenderedMarkdown('')
-        return
-      }
-      const markdown = await shikiMarkdownIt(translateOutput)
-      if (!cancelled) {
-        setRenderedMarkdown(markdown)
-      }
-    }
-    void render()
+    isMountedRef.current = true
     return () => {
-      cancelled = true
+      isMountedRef.current = false
+      pendingImmediateRef.current = false
+      if (renderTimerRef.current !== null) {
+        window.clearTimeout(renderTimerRef.current)
+        renderTimerRef.current = null
+      }
     }
-  }, [enableMarkdown, shikiMarkdownIt, translateOutput])
+  }, [])
+
+  useEffect(() => {
+    shikiFnRef.current = shikiMarkdownIt
+    latestOutputRef.current = translateOutput
+    enableMarkdownRef.current = enableMarkdown
+
+    if (!enableMarkdown || !translateOutput) {
+      if (renderTimerRef.current !== null) {
+        window.clearTimeout(renderTimerRef.current)
+        renderTimerRef.current = null
+      }
+      pendingImmediateRef.current = false
+      if (!translateOutput) {
+        // Invalidate in-flight renders and reset cadence state so the next
+        // translation starts from a clean, immediately-renderable slate.
+        outputEpochRef.current += 1
+        previousOutputRef.current = undefined
+        lastOutputChangeAtRef.current = undefined
+        lastMarkdownRenderAtRef.current = 0
+      }
+      setRenderedMarkdown('')
+      return
+    }
+
+    // Pace stream frames (changes within playout cadence); discrete swaps and
+    // re-render triggers go immediate.
+    const now = Date.now()
+    const contentChanged = translateOutput !== previousOutputRef.current
+    // Discrete = this change did not follow the previous one within cadence.
+    const discreteSwap =
+      contentChanged &&
+      (lastOutputChangeAtRef.current === undefined ||
+        now - lastOutputChangeAtRef.current > MARKDOWN_RENDER_STREAM_CADENCE_MS)
+    const delay = nextMarkdownRenderDelay(
+      translateOutput,
+      previousOutputRef.current,
+      lastMarkdownRenderAtRef.current,
+      now,
+      lastOutputChangeAtRef.current
+    )
+    if (contentChanged) {
+      lastOutputChangeAtRef.current = now
+    }
+    previousOutputRef.current = translateOutput
+
+    if (delay === 0) {
+      // The immediate render supersedes any armed trailing timer.
+      if (renderTimerRef.current !== null) {
+        window.clearTimeout(renderTimerRef.current)
+        renderTimerRef.current = null
+      }
+      // Immediate requests skipped mid-flight (dep change or discrete swap)
+      // are caught up after the render; paced-due stream frames are not.
+      if (renderInFlightRef.current && (!contentChanged || discreteSwap)) {
+        pendingImmediateRef.current = true
+      } else {
+        void runMarkdownRender()
+      }
+    } else if (renderTimerRef.current === null) {
+      renderTimerRef.current = window.setTimeout(() => {
+        renderTimerRef.current = null
+        void runMarkdownRender()
+      }, delay)
+    }
+  }, [enableMarkdown, runMarkdownRender, shikiMarkdownIt, translateOutput])
 
   const modelSelectorFilter = useCallback(
     (model: SelectorModel) =>
